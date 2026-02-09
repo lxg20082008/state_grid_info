@@ -16,19 +16,17 @@ from homeassistant.const import CONF_NAME
 from .const import (
     DOMAIN,
     DATA_SOURCE_HASSBOX, DATA_SOURCE_QINGLONG,
-    BILLING_TYPE_SINGLE, BILLING_TYPE_SEGMENTED,
     BILLING_STANDARD_YEAR_阶梯, BILLING_STANDARD_YEAR_阶梯_峰平谷,
     BILLING_STANDARD_MONTH_阶梯, BILLING_STANDARD_MONTH_阶梯_峰平谷,
     BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格, BILLING_STANDARD_OTHER_平均单价,
-    CONF_DATA_SOURCE, CONF_BILLING_TYPE, CONF_BILLING_STANDARD,
-    CONF_SEGMENT_DATE, CONF_SEGMENT_BEFORE_STANDARD, CONF_SEGMENT_AFTER_STANDARD,
-    CONF_CONSUMER_NUMBER, CONF_CONSUMER_NUMBER_INDEX,
+    CONF_DATA_SOURCE, CONF_BILLING_STANDARD,
+    CONF_CONSUMER_NUMBER, CONF_CONSUMER_NUMBER_INDEX, CONF_CONSUMER_NAME,
     CONF_MQTT_HOST, CONF_MQTT_PORT, CONF_MQTT_USERNAME, CONF_MQTT_PASSWORD, CONF_STATE_GRID_ID,
     CONF_LADDER_LEVEL_1, CONF_LADDER_LEVEL_2,
     CONF_LADDER_PRICE_1, CONF_LADDER_PRICE_2, CONF_LADDER_PRICE_3,
     CONF_YEAR_LADDER_START,
     CONF_PRICE_PEAK, CONF_PRICE_FLAT, CONF_PRICE_VALLEY, CONF_PRICE_TIP,
-    CONF_MONTH_PRICES, CONF_AVERAGE_PRICE,
+    CONF_MONTH_PRICES, CONF_AVERAGE_PRICE, CONF_IS_PREPAID,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -388,6 +386,9 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
     def _process_hassbox_data(self, power_user_data):
         """Process HassBox integration data."""
         try:
+            # 获取户名并记录日志
+            consumer_name = power_user_data.get("consName_dst", "")
+
             # 提取文件json日用电数据（大概是最近40天左右）
             daily_bill_list = power_user_data.get("daily_bill_list", [])
             # 重写结构
@@ -458,7 +459,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             daylist6 = sorted(daylist5.values(), key=lambda x: x["day"])
             
             # 取最新的370个数据（总数大概370-390波动）
-            daylist7 = list(reversed(daylist6))[:370]
+            daylist7 = list(reversed(daylist6))
             
             # 先创建一个临时数据结构，用于计算电费
             # 这样可以确保在计算电费时 self.data 不为 None
@@ -476,10 +477,29 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             
             # 计算每日电费
             dayList = self._calculate_daily_cost(daylist7)
-            
+
+            # 删除尾部的连续全0数据
+            # 从后往前遍历，找到第一个非0的数据项
+            last_non_zero_index = len(dayList) - 1
+            while last_non_zero_index >= 0:
+                item = dayList[last_non_zero_index]
+                # 检查所有数值字段是否都为0
+                if (item.get("dayEleNum", 0) == 0 and
+                    item.get("dayEleCost", 0) == 0 and
+                    item.get("dayTPq", 0) == 0 and
+                    item.get("dayPPq", 0) == 0 and
+                    item.get("dayNPq", 0) == 0 and
+                    item.get("dayVPq", 0) == 0):
+                    last_non_zero_index -= 1
+                else:
+                    break
+            # 只保留到第一个非0数据项
+            if last_non_zero_index < len(dayList) - 1:
+                dayList = dayList[:last_non_zero_index + 1]
+
             # 恢复原始数据
             self.data = original_data
-            
+
             # 重写月用电结构
             monthList = []
             for item in month_bill_list:
@@ -508,6 +528,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 "dayList": dayList,
                 "monthList": monthList,
                 "yearList": yearList,
+                "consumer_name": power_user_data.get("consName_dst", ""),
             }
         except Exception as ex:
             _LOGGER.error("Error processing HassBox data: %s", ex)
@@ -571,29 +592,14 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
     def _calculate_daily_cost(self, day_list):
         """Calculate daily electricity cost based on billing standard."""
         try:
-            billing_type = self.config.get(CONF_BILLING_TYPE)
             billing_standard = self.config.get(CONF_BILLING_STANDARD)
             
             result = []
             for item in day_list:
                 day_cost = 0
                 
-                # 根据计费类型和标准计算每日电费
-                if billing_type == BILLING_TYPE_SINGLE:
-                    day_cost = self._calculate_cost_by_standard(item, billing_standard)
-                elif billing_type == BILLING_TYPE_SEGMENTED:
-                    # 分段计费
-                    segment_date = self.config.get(CONF_SEGMENT_DATE)
-                    day_date = item["day"].replace("-", "")[:6]  # 取年月部分
-                    
-                    if day_date < segment_date:
-                        # 分段前
-                        before_standard = self.config.get(CONF_SEGMENT_BEFORE_STANDARD)
-                        day_cost = self._calculate_cost_by_standard(item, before_standard, prefix="before_")
-                    else:
-                        # 分段后
-                        after_standard = self.config.get(CONF_SEGMENT_AFTER_STANDARD)
-                        day_cost = self._calculate_cost_by_standard(item, after_standard, prefix="after_")
+                # 根据计费标准计算每日电费
+                day_cost = self._calculate_cost_by_standard(item, billing_standard)
                 
                 # 添加电费到结果中，调整字段顺序
                 result.append({
@@ -611,7 +617,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error calculating daily cost: %s", ex)
             return day_list
 
-    def _calculate_cost_by_standard(self, day_data, standard, prefix=""):
+    def _calculate_cost_by_standard(self, day_data, standard):
         """Calculate cost based on specific billing standard."""
         try:
             day_ele_num = day_data["dayEleNum"]
@@ -622,69 +628,45 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
             
             if standard == BILLING_STANDARD_YEAR_阶梯:
                 # 年阶梯计费
-                ladder_level_1 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_1}", 2160)
-                ladder_level_2 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_2}", 4200)
-                price_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}", 0.4983)
-                price_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}", 0.5483)
-                price_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}", 0.7983)
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 2160)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 4200)
+                price_1 = self.config.get(CONF_LADDER_PRICE_1, 0.4983)
+                price_2 = self.config.get(CONF_LADDER_PRICE_2, 0.5483)
+                price_3 = self.config.get(CONF_LADDER_PRICE_3, 0.7983)
+                
+                # 获取年阶梯起始日期（默认为当年1月1日）
+                year_ladder_start = self.config.get(CONF_YEAR_LADDER_START, "0101")
                 
                 # 获取当前日期和年份
                 current_day = day_data["day"]
-                current_year = current_day.split("-")[0]
+                current_year = int(current_day.split("-")[0])
+                current_month = int(current_day.split("-")[1])
+                current_day_int = int(current_day.split("-")[2])
                 
-                # 获取年阶梯起始日期（默认为当年1月1日）
-                year_ladder_start = self.config.get(f"{prefix}{CONF_YEAR_LADDER_START}", f"0101")
-                year_ladder_start_date = current_year + "-" + year_ladder_start[:2] + "-" + year_ladder_start[2:]
+                # 解析年阶梯起始日期
+                start_month = int(year_ladder_start[:2])
+                start_day_int = int(year_ladder_start[2:])
                 
-                # 检查当前日期是否在年阶梯起始日期之前（跨年情况）
-                is_before_ladder_start = current_day < year_ladder_start_date
+                # 推算年阶梯起始日期的年份
+                # 如果当前日期小于起始日期，则是上一年的起始日期
+                if (current_month < start_month) or (current_month == start_month and current_day_int < start_day_int):
+                    ladder_year = current_year - 1
+                else:
+                    ladder_year = current_year
+                
+                # 格式化年阶梯起始日期和结束日期
+                year_ladder_start_date = f"{ladder_year}-{year_ladder_start[:2]}-{year_ladder_start[2:]}"
+                year_ladder_end_date = f"{ladder_year + 1}-{year_ladder_start[:2]}-{year_ladder_start[2:]}"
                 
                 # 计算累计用电量
                 year_accumulated = 0
                 
-                # 检查是否为分段计费模式
-                billing_type = self.config.get(CONF_BILLING_TYPE)
-                is_segmented = billing_type == BILLING_TYPE_SEGMENTED
-                segment_date = self.config.get(CONF_SEGMENT_DATE, "") if is_segmented else ""
-                day_date = current_day.replace("-", "")[:6]  # 取年月部分
-                
                 if self.data is not None:
                     for data in self.data.get("dayList", []):
-                        data_date = data["day"].replace("-", "")[:6]
-                        
-                        # 处理跨年情况
-                        if is_before_ladder_start:
-                            # 如果是跨年情况，需要计算两部分累计电量：
-                            # 1. 上一年的阶梯起始日期到12月31日
-                            # 2. 当前年的1月1日到当前日期
-                            
-                            # 第一部分：上一年的累计电量
-                            prev_year = str(int(current_year) - 1)
-                            prev_year_ladder_start_date = prev_year + "-" + year_ladder_start[:2] + "-" + year_ladder_start[2:]
-                            prev_year_end_date = prev_year + "-12-31"
-                            
-                            # 第二部分：当前年的累计电量
-                            current_year_start_date = current_year + "-01-01"
-                            
-                            if (data["day"] >= prev_year_ladder_start_date and 
-                                data["day"] <= prev_year_end_date and 
-                                data["day"].startswith(prev_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
-                            
-                            # 添加当前年1月1日到当前日期的累计电量
-                            if (data["day"] >= current_year_start_date and 
-                                data["day"] <= current_day and 
-                                data["day"].startswith(current_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
-                        else:
-                            # 正常情况，计算当前年的累计电量
-                            if (data["day"] >= year_ladder_start_date and 
-                                data["day"] <= current_day and 
-                                data["day"].startswith(current_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
+                        # 计算年累计用电量：从年阶梯起始日期到当前日期
+                        if (data["day"] >= year_ladder_start_date and 
+                            data["day"] <= current_day):
+                            year_accumulated += data["dayEleNum"]
                 
                 # 根据累计用电量计算阶梯电价
                 if year_accumulated <= ladder_level_1:
@@ -727,82 +709,58 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
             elif standard == BILLING_STANDARD_YEAR_阶梯_峰平谷:
                 # 年阶梯+峰平谷计费
-                ladder_level_1 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_1}", 2160)
-                ladder_level_2 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_2}", 4200)
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 2160)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 4200)
                 
-                # 各阶梯的峰平谷电价
-                price_tip_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5483)
-                price_peak_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5483)
-                price_flat_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5483)
-                price_valley_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.2983)
+                # 各阶梯的峰平谷价
+                price_tip_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5483)
+                price_peak_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5483)
+                price_flat_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5483)
+                price_valley_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.2983)
                 
-                price_tip_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5983)
-                price_peak_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5983)
-                price_flat_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5983)
-                price_valley_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.3483)
+                price_tip_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5983)
+                price_peak_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5983)
+                price_flat_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5983)
+                price_valley_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.3483)
                 
-                price_tip_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8483)
-                price_peak_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8483)
-                price_flat_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8483)
-                price_valley_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.5983)
+                price_tip_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8483)
+                price_peak_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8483)
+                price_flat_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8483)
+                price_valley_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.5983)
+                
+                # 获取年阶梯起始日期（默认为当年1月1日）
+                year_ladder_start = self.config.get(CONF_YEAR_LADDER_START, "0101")
                 
                 # 获取当前日期和年份
                 current_day = day_data["day"]
-                current_year = current_day.split("-")[0]
+                current_year = int(current_day.split("-")[0])
+                current_month = int(current_day.split("-")[1])
+                current_day_int = int(current_day.split("-")[2])
                 
-                # 获取年阶梯起始日期（默认为当年1月1日）
-                year_ladder_start = self.config.get(f"{prefix}{CONF_YEAR_LADDER_START}", f"0101")
-                year_ladder_start_date = current_year + "-" + year_ladder_start[:2] + "-" + year_ladder_start[2:]
+                # 解析年阶梯起始日期
+                start_month = int(year_ladder_start[:2])
+                start_day_int = int(year_ladder_start[2:])
                 
-                # 检查当前日期是否在年阶梯起始日期之前（跨年情况）
-                is_before_ladder_start = current_day < year_ladder_start_date
+                # 推算年阶梯起始日期的年份
+                # 如果当前日期小于起始日期，则是上一年的起始日期
+                if (current_month < start_month) or (current_month == start_month and current_day_int < start_day_int):
+                    ladder_year = current_year - 1
+                else:
+                    ladder_year = current_year
+                
+                # 格式化年阶梯起始日期和结束日期
+                year_ladder_start_date = f"{ladder_year}-{year_ladder_start[:2]}-{year_ladder_start[2:]}"
+                year_ladder_end_date = f"{ladder_year + 1}-{year_ladder_start[:2]}-{year_ladder_start[2:]}"
                 
                 # 计算累计用电量
                 year_accumulated = 0
                 
-                # 检查是否为分段计费模式
-                billing_type = self.config.get(CONF_BILLING_TYPE)
-                is_segmented = billing_type == BILLING_TYPE_SEGMENTED
-                segment_date = self.config.get(CONF_SEGMENT_DATE, "") if is_segmented else ""
-                day_date = current_day.replace("-", "")[:6]  # 取年月部分
-                
                 if self.data is not None:
                     for data in self.data.get("dayList", []):
-                        data_date = data["day"].replace("-", "")[:6]
-                        
-                        # 处理跨年情况
-                        if is_before_ladder_start:
-                            # 如果是跨年情况，需要计算两部分累计电量：
-                            # 1. 上一年的阶梯起始日期到12月31日
-                            # 2. 当前年的1月1日到当前日期
-                            
-                            # 第一部分：上一年的累计电量
-                            prev_year = str(int(current_year) - 1)
-                            prev_year_ladder_start_date = prev_year + "-" + year_ladder_start[:2] + "-" + year_ladder_start[2:]
-                            prev_year_end_date = prev_year + "-12-31"
-                            
-                            # 第二部分：当前年的累计电量
-                            current_year_start_date = current_year + "-01-01"
-                            
-                            if (data["day"] >= prev_year_ladder_start_date and 
-                                data["day"] <= prev_year_end_date and 
-                                data["day"].startswith(prev_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
-                            
-                            # 添加当前年1月1日到当前日期的累计电量
-                            if (data["day"] >= current_year_start_date and 
-                                data["day"] <= current_day and 
-                                data["day"].startswith(current_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
-                        else:
-                            # 正常情况，计算当前年的累计电量
-                            if (data["day"] >= year_ladder_start_date and 
-                                data["day"] <= current_day and 
-                                data["day"].startswith(current_year) and
-                                (not is_segmented or (data_date < segment_date) == (day_date < segment_date))):
-                                year_accumulated += data["dayEleNum"]
+                        # 计算年累计用电量：从年阶梯起始日期到当前日期
+                        if (data["day"] >= year_ladder_start_date and 
+                            data["day"] <= current_day):
+                            year_accumulated += data["dayEleNum"]
                 
                 # 根据累计用电量确定当前阶梯
                 if year_accumulated <= ladder_level_1:
@@ -891,11 +849,11 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
             elif standard == BILLING_STANDARD_MONTH_阶梯:
                 # 月阶梯计费
-                ladder_level_1 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_1}", 180)
-                ladder_level_2 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_2}", 280)
-                price_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}", 0.5224)
-                price_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}", 0.6224)
-                price_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}", 0.8334)
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 180)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 280)
+                price_1 = self.config.get(CONF_LADDER_PRICE_1, 0.5224)
+                price_2 = self.config.get(CONF_LADDER_PRICE_2, 0.6224)
+                price_3 = self.config.get(CONF_LADDER_PRICE_3, 0.8334)
                 
                 # 获取当前年月
                 current_year_month = day_data["day"][:7]  # 格式：YYYY-MM
@@ -949,24 +907,24 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
             elif standard == BILLING_STANDARD_MONTH_阶梯_峰平谷:
                 # 月阶梯+峰平谷计费
-                ladder_level_1 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_1}", 180)
-                ladder_level_2 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_2}", 280)
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 180)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 280)
                 
-                # 各阶梯的峰平谷电价
-                price_tip_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5283)
-                price_peak_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5283)
-                price_flat_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5283)
-                price_valley_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.5283)
+                # 各阶梯的峰平谷价
+                price_tip_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5283)
+                price_peak_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5283)
+                price_flat_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5283)
+                price_valley_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.5283)
                 
-                price_tip_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5783)
-                price_peak_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5783)
-                price_flat_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5783)
-                price_valley_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.5783)
+                price_tip_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5783)
+                price_peak_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5783)
+                price_flat_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5783)
+                price_valley_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.5783)
                 
-                price_tip_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8283)
-                price_peak_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8283)
-                price_flat_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8283)
-                price_valley_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.8283)
+                price_tip_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8283)
+                price_peak_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8283)
+                price_flat_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8283)
+                price_valley_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.8283)
                 
                 # 获取当前年月
                 current_year_month = day_data["day"][:7]  # 格式：YYYY-MM
@@ -1066,34 +1024,34 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
             elif standard == BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格:
                 # 月阶梯+峰平谷+变动价格
-                ladder_level_1 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_1}", 180)
-                ladder_level_2 = self.config.get(f"{prefix}{CONF_LADDER_LEVEL_2}", 280)
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 180)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 280)
                 
-                # 各阶梯的尖峰平谷电价
+                # 各阶梯的尖平谷价
                 # 第一阶梯
-                price_tip_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5224)
-                price_peak_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5224)
-                price_flat_1 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5224)
+                price_tip_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5224)
+                price_peak_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5224)
+                price_flat_1 = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5224)
                 
                 # 第二阶梯
-                price_tip_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.6224)
-                price_peak_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.6224)
-                price_flat_2 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.6224)
+                price_tip_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.6224)
+                price_peak_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.6224)
+                price_flat_2 = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.6224)
                 
                 # 第三阶梯
-                price_tip_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8224)
-                price_peak_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8224)
-                price_flat_3 = self.config.get(f"{prefix}{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8224)
+                price_tip_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8224)
+                price_peak_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8224)
+                price_flat_3 = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8224)
                 
                 # 获取当前日期信息
                 current_date = day_data["day"]
                 current_year_month = current_date[:7]  # 格式：YYYY-MM
                 month = int(current_date[5:7])  # 当前月份，1-12
                 
-                # 获取当月各阶梯的谷电价
-                valley_price_1 = self.config.get(f"{prefix}month_{month:02d}_ladder_1_valley", 0.2535)
-                valley_price_2 = self.config.get(f"{prefix}month_{month:02d}_ladder_2_valley", 0.3535)
-                valley_price_3 = self.config.get(f"{prefix}month_{month:02d}_ladder_3_valley", 0.5535)
+                # 获取当月各阶梯的谷价
+                valley_price_1 = self.config.get(f"month_{month:02d}_ladder_1_valley", 0.2535)
+                valley_price_2 = self.config.get(f"month_{month:02d}_ladder_2_valley", 0.3535)
+                valley_price_3 = self.config.get(f"month_{month:02d}_ladder_3_valley", 0.5535)
                 
                 # 计算当月累计用电量（截至当前日期）
                 month_accumulated = 0
@@ -1192,7 +1150,7 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
                 
             elif standard == BILLING_STANDARD_OTHER_平均单价:
                 # 其他-平均单价
-                avg_price = self.config.get(f"{prefix}{CONF_AVERAGE_PRICE}", 0.6)
+                avg_price = self.config.get(CONF_AVERAGE_PRICE, 0.6)
                 return day_ele_num * avg_price
                 
             return 0
@@ -1205,20 +1163,26 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
         try:
             # 确保月列表按时间降序排序（最新的月份在前）
             month_list = sorted(month_list, key=lambda x: x["month"], reverse=True)
-            
+
             # 增加当月数据（如果不存在）
             now = datetime.now()
             current_month_str = now.strftime("%Y-%m")
+
             if not any(item["month"] == current_month_str for item in month_list):
                 # 计算当月数据
                 current_month_data = self._calculate_month_data(day_list, current_month_str)
                 if current_month_data:
                     month_list.insert(0, current_month_data)
-            
+
             # 增加上月数据（如果不存在）
-            prev_month = datetime(now.year, now.month - 1 if now.month > 1 else 12, 1)
+            if now.month == 1:
+                # 如果当前是1月，上月是上一年12月
+                prev_month = datetime(now.year - 1, 12, 1)
+            else:
+                # 其他情况，上月是当前年的上个月
+                prev_month = datetime(now.year, now.month - 1, 1)
             prev_month_str = prev_month.strftime("%Y-%m")
-            
+
             if not any(item["month"] == prev_month_str for item in month_list):
                 # 计算上月数据
                 prev_month_data = self._calculate_month_data(day_list, prev_month_str)
@@ -1264,17 +1228,17 @@ class StateGridInfoDataCoordinator(DataUpdateCoordinator):
         try:
             year_month = month_str.replace('-', '')
             days_in_month = [day for day in day_list if day["day"].replace('-', '')[:6] == year_month]
-            
+
             if not days_in_month:
                 return None
-            
+
             month_ele_num = sum(float(day.get("dayEleNum", 0)) for day in days_in_month)
             month_tpq = sum(float(day.get("dayTPq", 0)) for day in days_in_month)
             month_ppq = sum(float(day.get("dayPPq", 0)) for day in days_in_month)
             month_npq = sum(float(day.get("dayNPq", 0)) for day in days_in_month)
             month_vpq = sum(float(day.get("dayVPq", 0)) for day in days_in_month)
             month_ele_cost = sum(float(day.get("dayEleCost", 0)) for day in days_in_month)
-            
+
             return {
                 "month": month_str,
                 "monthEleNum": float(round(month_ele_num, 2)),
@@ -1344,13 +1308,27 @@ class StateGridInfoSensor(SensorEntity):
         consumer_number = config.get(CONF_CONSUMER_NUMBER, "")
         self.entity_id = f"sensor.state_grid_{consumer_number}"
         self._attr_unique_id = f"state_grid_{consumer_number}"
-        self._attr_icon = "mdi:flash"        
+        self._attr_icon = "mdi:flash"
+
         self._attr_name = f"国家电网 {consumer_number}"
         self._attr_native_unit_of_measurement = "元"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"state_grid_{consumer_number}")},
-            "name": f"国家电网 {consumer_number}",
+        self._consumer_number = consumer_number
+
+    @property
+    def device_info(self):
+        """Return device info."""
+        # 动态获取户名：优先从数据中获取，如果没有则从配置中获取
+        consumer_name = ""
+        if self.coordinator.data and "consumer_name" in self.coordinator.data:
+            consumer_name = self.coordinator.data.get("consumer_name", "")
+        elif CONF_CONSUMER_NAME in self.config:
+            consumer_name = self.config.get(CONF_CONSUMER_NAME, "")
+
+        return {
+            "identifiers": {(DOMAIN, f"state_grid_{self._consumer_number}")},
+            "name": f"国家电网 {self._consumer_number}",
             "manufacturer": "国家电网",
+            "model": f"户名:{consumer_name}"
         }
         
     @property
@@ -1415,6 +1393,7 @@ class StateGridInfoSensor(SensorEntity):
                             # 将日均消费和剩余天数放在最前面
                             attrs["日均消费"] = round(avg_daily_cost, 2)
                             attrs["剩余天数"] = math.ceil(remaining_days)
+                            attrs["预付费"] = "是" if self.config.get(CONF_IS_PREPAID, False) else "否"
                             
                         except (ValueError, IndexError) as e:
                             _LOGGER.error("计算剩余天数时出错: %s", e)
@@ -1427,8 +1406,234 @@ class StateGridInfoSensor(SensorEntity):
                 "yearlist": self.coordinator.data.get("yearList", []),
             })
         
+        # 添加计费标准配置
+        billing_standard_attrs = {}
+        billing_standard = self.config.get(CONF_BILLING_STANDARD, "")
+        
+        # 获取阶梯档和累计用电量信息
+        ladder_info = self._get_ladder_info(billing_standard)
+        
+        # 将计费标准转换为中文显示
+        billing_standard_map = {
+            BILLING_STANDARD_YEAR_阶梯: "年阶梯",
+            BILLING_STANDARD_YEAR_阶梯_峰平谷: "年阶梯峰平谷", 
+            BILLING_STANDARD_MONTH_阶梯: "月阶梯",
+            BILLING_STANDARD_MONTH_阶梯_峰平谷: "月阶梯峰平谷",
+            BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格: "月阶梯峰平谷变动价格",
+            BILLING_STANDARD_OTHER_平均单价: "平均单价"
+        }
+        billing_standard_chinese = billing_standard_map.get(billing_standard, billing_standard)
+        billing_standard_attrs["计费标准"] = billing_standard_chinese
+        
+        # 将阶梯信息添加到计费标准属性中
+        billing_standard_attrs.update(ladder_info)
+        
+        # 根据不同计费标准添加相应配置
+        if billing_standard in [BILLING_STANDARD_YEAR_阶梯, BILLING_STANDARD_YEAR_阶梯_峰平谷]:
+            billing_standard_attrs["年阶梯第2档起始电量"] = self.config.get(CONF_LADDER_LEVEL_1, 2160)
+            billing_standard_attrs["年阶梯第3档起始电量"] = self.config.get(CONF_LADDER_LEVEL_2, 4200)
+            
+            # 获取年阶梯起始日期并计算当前年份的起始和结束日期
+            year_ladder_start = self.config.get(CONF_YEAR_LADDER_START, "0101")
+            current_date = datetime.now()
+            current_year = current_date.year
+            current_month = current_date.month
+            current_day_int = current_date.day
+            
+            # 解析年阶梯起始日期
+            start_month = int(year_ladder_start[:2])
+            start_day = int(year_ladder_start[2:])
+            
+            # 推算年阶梯起始日期的年份
+            if (current_month < start_month) or (current_month == start_month and current_day_int < start_day):
+                ladder_year = current_year - 1
+            else:
+                ladder_year = current_year
+            
+            # 格式化年阶梯起始日期和结束日期
+            year_ladder_start_date_formatted = f"{ladder_year}.{year_ladder_start[:2]}.{year_ladder_start[2:]}"
+            
+            # 计算结束日期：次年起始日期减1天
+            start_date_next_year = datetime(ladder_year + 1, start_month, start_day)
+            end_date = start_date_next_year - timedelta(days=1)
+            year_ladder_end_date_formatted = f"{end_date.year}.{end_date.month:02d}.{end_date.day:02d}"
+            
+            billing_standard_attrs["当前年阶梯起始日期"] = year_ladder_start_date_formatted
+            billing_standard_attrs["当前年阶梯结束日期"] = year_ladder_end_date_formatted
+            
+            if billing_standard == BILLING_STANDARD_YEAR_阶梯:
+                billing_standard_attrs["年阶梯第1档电价"] = self.config.get(CONF_LADDER_PRICE_1, 0.4983)
+                billing_standard_attrs["年阶梯第2档电价"] = self.config.get(CONF_LADDER_PRICE_2, 0.5483)
+                billing_standard_attrs["年阶梯第3档电价"] = self.config.get(CONF_LADDER_PRICE_3, 0.7983)
+            elif billing_standard == BILLING_STANDARD_YEAR_阶梯_峰平谷:
+                billing_standard_attrs["年阶梯第1档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5483)
+                billing_standard_attrs["年阶梯第1档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5483)
+                billing_standard_attrs["年阶梯第1档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5483)
+                billing_standard_attrs["年阶梯第1档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.2983)
+                
+                billing_standard_attrs["年阶梯第2档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5983)
+                billing_standard_attrs["年阶梯第2档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5983)
+                billing_standard_attrs["年阶梯第2档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5983)
+                billing_standard_attrs["年阶梯第2档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.3483)
+                
+                billing_standard_attrs["年阶梯第3档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8483)
+                billing_standard_attrs["年阶梯第3档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8483)
+                billing_standard_attrs["年阶梯第3档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8483)
+                billing_standard_attrs["年阶梯第3档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.5983)
+        
+        elif billing_standard in [BILLING_STANDARD_MONTH_阶梯, BILLING_STANDARD_MONTH_阶梯_峰平谷, BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格]:
+            billing_standard_attrs["月阶梯第2档起始电量"] = self.config.get(CONF_LADDER_LEVEL_1, 180)
+            billing_standard_attrs["月阶梯第3档起始电量"] = self.config.get(CONF_LADDER_LEVEL_2, 280)
+            
+            if billing_standard == BILLING_STANDARD_MONTH_阶梯:
+                billing_standard_attrs["月阶梯第1档电价"] = self.config.get(CONF_LADDER_PRICE_1, 0.5224)
+                billing_standard_attrs["月阶梯第2档电价"] = self.config.get(CONF_LADDER_PRICE_2, 0.6224)
+                billing_standard_attrs["月阶梯第3档电价"] = self.config.get(CONF_LADDER_PRICE_3, 0.8334)
+            elif billing_standard == BILLING_STANDARD_MONTH_阶梯_峰平谷:
+                billing_standard_attrs["月阶梯第1档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5283)
+                billing_standard_attrs["月阶梯第1档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5283)
+                billing_standard_attrs["月阶梯第1档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5283)
+                billing_standard_attrs["月阶梯第1档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_VALLEY}", 0.5283)
+                
+                billing_standard_attrs["月阶梯第2档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.5783)
+                billing_standard_attrs["月阶梯第2档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.5783)
+                billing_standard_attrs["月阶梯第2档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.5783)
+                billing_standard_attrs["月阶梯第2档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_VALLEY}", 0.5783)
+                
+                billing_standard_attrs["月阶梯第3档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8283)
+                billing_standard_attrs["月阶梯第3档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8283)
+                billing_standard_attrs["月阶梯第3档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8283)
+                billing_standard_attrs["月阶梯第3档谷电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_VALLEY}", 0.8283)
+            elif billing_standard == BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格:
+                billing_standard_attrs["月阶梯第1档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_TIP}", 0.5224)
+                billing_standard_attrs["月阶梯第1档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_PEAK}", 0.5224)
+                billing_standard_attrs["月阶梯第1档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_1}_{CONF_PRICE_FLAT}", 0.5224)
+                
+                billing_standard_attrs["月阶梯第2档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_TIP}", 0.6224)
+                billing_standard_attrs["月阶梯第2档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_PEAK}", 0.6224)
+                billing_standard_attrs["月阶梯第2档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_2}_{CONF_PRICE_FLAT}", 0.6224)
+                
+                billing_standard_attrs["月阶梯第3档尖电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_TIP}", 0.8224)
+                billing_standard_attrs["月阶梯第3档峰电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_PEAK}", 0.8224)
+                billing_standard_attrs["月阶梯第3档平电价"] = self.config.get(f"{CONF_LADDER_PRICE_3}_{CONF_PRICE_FLAT}", 0.8224)
+                
+                # 添加月份变动的谷价
+                for month in range(1, 13):
+                    valley_price_1 = self.config.get(f"month_{month:02d}_ladder_1_valley")
+                    valley_price_2 = self.config.get(f"month_{month:02d}_ladder_2_valley")
+                    valley_price_3 = self.config.get(f"month_{month:02d}_ladder_3_valley")
+                    if valley_price_1 is not None:
+                        billing_standard_attrs[f"{month}月阶梯第1档谷电价"] = valley_price_1
+                    if valley_price_2 is not None:
+                        billing_standard_attrs[f"{month}月阶梯第2档谷电价"] = valley_price_2
+                    if valley_price_3 is not None:
+                        billing_standard_attrs[f"{month}月阶梯第3档谷电价"] = valley_price_3
+        
+        elif billing_standard == BILLING_STANDARD_OTHER_平均单价:
+            billing_standard_attrs["平均单价"] = self.config.get(CONF_AVERAGE_PRICE, 0.6)
+
+        
+        # 添加计费标准属性到主属性
+        attrs["计费标准"] = billing_standard_attrs
+        
         # 添加状态信息
         attrs["数据源"] = self.config.get(CONF_DATA_SOURCE, "unknown")
         attrs["最后同步日期"] = self.coordinator.last_update_time.strftime("%Y-%m-%d %H:%M:%S")
             
         return attrs
+
+    def _get_ladder_info(self, billing_standard):
+        """获取当前阶梯档和累计用电量信息"""
+        try:
+            if not self.coordinator.data or not self.coordinator.data.get("dayList"):
+                return {}
+                
+            day_list = self.coordinator.data.get("dayList", [])
+            if not day_list:
+                return {}
+                
+            # 获取最新的日期（假设dayList已经按日期排序）
+            latest_day_data = None
+            if day_list:
+                # 找到最新的一天数据
+                sorted_days = sorted(day_list, key=lambda x: x["day"], reverse=True)
+                latest_day_data = sorted_days[0]
+            
+            if not latest_day_data:
+                return {}
+            
+            ladder_info = {}
+            
+            if billing_standard in [BILLING_STANDARD_YEAR_阶梯, BILLING_STANDARD_YEAR_阶梯_峰平谷]:
+                # 年阶梯计算
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 2160)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 4200)
+                
+                # 获取年阶梯起始日期
+                year_ladder_start = self.config.get(CONF_YEAR_LADDER_START, "0101")
+                current_day = latest_day_data["day"]
+                current_year = int(current_day.split("-")[0])
+                current_month = int(current_day.split("-")[1])
+                current_day_int = int(current_day.split("-")[2])
+                
+                # 解析年阶梯起始日期
+                start_month = int(year_ladder_start[:2])
+                start_day = int(year_ladder_start[2:])
+                
+                # 推算年阶梯起始日期的年份
+                if (current_month < start_month) or (current_month == start_month and current_day_int < start_day):
+                    ladder_year = current_year - 1
+                else:
+                    ladder_year = current_year
+                
+                # 格式化年阶梯起始日期
+                year_ladder_start_date = f"{ladder_year}-{year_ladder_start[:2]}-{year_ladder_start[2:]}"
+                
+                # 计算年累计用电量
+                year_accumulated = 0
+                for data in day_list:
+                    if data["day"] >= year_ladder_start_date and data["day"] <= current_day:
+                        year_accumulated += data["dayEleNum"]
+                
+                # 确定当前阶梯档
+                if year_accumulated <= ladder_level_1:
+                    current_ladder = "第1档"
+                elif year_accumulated <= ladder_level_2:
+                    current_ladder = "第2档"
+                else:
+                    current_ladder = "第3档"
+                
+                ladder_info["当前年阶梯档"] = current_ladder
+                ladder_info["年阶梯累计用电量"] = round(year_accumulated, 2)
+                
+            elif billing_standard in [BILLING_STANDARD_MONTH_阶梯, BILLING_STANDARD_MONTH_阶梯_峰平谷, BILLING_STANDARD_MONTH_阶梯_峰平谷_变动价格]:
+                # 月阶梯计算
+                ladder_level_1 = self.config.get(CONF_LADDER_LEVEL_1, 180)
+                ladder_level_2 = self.config.get(CONF_LADDER_LEVEL_2, 280)
+                
+                # 获取当前月份
+                current_day = latest_day_data["day"]
+                current_year_month = current_day[:7]  # YYYY-MM
+                
+                # 计算月累计用电量
+                month_accumulated = 0
+                for data in day_list:
+                    if data["day"].startswith(current_year_month) and data["day"] <= current_day:
+                        month_accumulated += data["dayEleNum"]
+                
+                # 确定当前阶梯档
+                if month_accumulated <= ladder_level_1:
+                    current_ladder = "第1档"
+                elif month_accumulated <= ladder_level_2:
+                    current_ladder = "第2档"
+                else:
+                    current_ladder = "第3档"
+                
+                ladder_info["当前月阶梯档"] = current_ladder
+                ladder_info["月阶梯累计用电量"] = round(month_accumulated, 2)
+            
+            return ladder_info
+                
+        except Exception as ex:
+            _LOGGER.error("Error getting ladder info: %s", ex)
+            return {}
